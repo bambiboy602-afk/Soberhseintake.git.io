@@ -1,0 +1,36 @@
+{
+  "entities": {
+    "Resident": {
+      "title": "Resident",
+      "description": "Resident information and application status",
+      "type": "object",
+      "properties": {
+        "fullName": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "status": { "type": "string", "enum": ["application", "approved", "scheduled", "orientation", "active"] },
+        "applicationDate": { "type": "string", "format": "date-time" },
+        "managerId": { "type": "string" },
+        "onboardingStep": { "type": "integer" },
+        "emergencyContact": { 
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "phone": { "type": "string" },
+            "relation": { "type": "string" }
+          }
+        },
+        "houseRulesSigned": { "type": "boolean" },
+        "residencyPaymentSigned": { "type": "boolean" },
+        "treatmentAgreementSigned": { "type": "boolean" },
+        "documentsSubmitted": { "type": "boolean" }
+      },
+      "required": ["fullName", "email", "status", "applicationDate"]
+    }
+  },
+  "firestore": {
+    "/residents/{residentId}": {
+      "schema": "Resident",
+      "description": "Resident applications and profile information"
+    }
+  }
+}
