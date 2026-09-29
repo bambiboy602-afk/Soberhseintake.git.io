@@ -6,8 +6,10 @@
       "type": "object",
       "properties": {
         "fullName": { "type": "string" },
+        "dob": { "type": "string" },
         "email": { "type": "string", "format": "email" },
-        "status": { "type": "string", "enum": ["application", "approved", "scheduled", "orientation", "active"] },
+        "language": { "type": "string" },
+        "status": { "type": "string", "enum": ["application", "pending_review", "approved", "scheduled", "orientation", "active"] },
         "applicationDate": { "type": "string", "format": "date-time" },
         "managerId": { "type": "string" },
         "onboardingStep": { "type": "integer" },
@@ -16,21 +18,62 @@
           "properties": {
             "name": { "type": "string" },
             "phone": { "type": "string" },
-            "relation": { "type": "string" }
+            "relation": { "type": "string" },
+            "isHCDM": { "type": "boolean" }
+          }
+        },
+        "insurance": {
+          "type": "object",
+          "properties": {
+            "planName": { "type": "string" },
+            "idNumber": { "type": "string" },
+            "type": { "type": "string" }
           }
         },
         "houseRulesSigned": { "type": "boolean" },
         "residencyPaymentSigned": { "type": "boolean" },
         "treatmentAgreementSigned": { "type": "boolean" },
-        "documentsSubmitted": { "type": "boolean" }
+        "generalConsentSigned": { "type": "boolean" },
+        "roiSigned": { "type": "boolean" },
+        "nppSigned": { "type": "boolean" },
+        "documentsSubmitted": { "type": "boolean" },
+        "checklist": {
+          "type": "object",
+          "properties": {
+            "photoId": { "type": "boolean" },
+            "tbDocumentation": { "type": "boolean" },
+            "naloxoneAttestation": { "type": "boolean" },
+            "lockableStorageAck": { "type": "boolean" },
+            "authorizedPresence": { "type": "boolean" }
+          }
+        },
+        "ownerId": { "type": "string" }
       },
-      "required": ["fullName", "email", "status", "applicationDate"]
+      "required": ["fullName", "email", "status", "ownerId"]
+    },
+    "ChatMessage": {
+      "title": "Chat Message",
+      "description": "A message sent between a resident and a manager",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "text": { "type": "string", "maxLength": 1000 },
+        "attachment": { "type": "string", "description": "Base64 encoded attachment" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "isAdmin": { "type": "boolean" }
+      },
+      "required": ["senderId", "senderName", "text", "createdAt", "isAdmin"]
     }
   },
   "firestore": {
     "/residents/{residentId}": {
       "schema": "Resident",
       "description": "Resident applications and profile information"
+    },
+    "/residents/{residentId}/messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Messages for a specific resident"
     }
   }
 }

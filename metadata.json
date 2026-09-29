@@ -1,6 +1,6 @@
 {
-  "name": "Sober-Living Move-In System",
-  "description": "A digital move-in workflow for sober living homes, streamlining applications and resident management.",
+  "name": "AZ Sober Living Master Intake",
+  "description": "Comprehensive Arizona-compliant intake and resident portal for sober living and behavioral health facilities, featuring real-time chat and Google Workspace integration.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

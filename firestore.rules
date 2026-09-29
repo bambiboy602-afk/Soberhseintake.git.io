@@ -1,27 +1,48 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Helper functions
+    // 3. Primitive Definition
     function isSignedIn() { return request.auth != null; }
+    function isManager() { return request.auth.token.email == 'bambiboy602@gmail.com'; }
     function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
-    function isOwner(residentId) { return isSignedIn() && request.auth.uid == residentId; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
     
+    // 2. Validation Blueprints
     function isValidResident(data) {
-      return data.fullName is string && data.fullName.size() > 0
-          && data.email is string && data.email.size() > 0
-          && data.status is string
+      return data.keys().hasAll(['fullName', 'email', 'status', 'ownerId'])
+          && data.keys().hasOnly(['fullName', 'dob', 'email', 'language', 'status', 'applicationDate', 'managerId', 'onboardingStep', 'emergencyContact', 'insurance', 'houseRulesSigned', 'residencyPaymentSigned', 'treatmentAgreementSigned', 'generalConsentSigned', 'roiSigned', 'nppSigned', 'documentsSubmitted', 'checklist', 'ownerId'])
+          && data.fullName is string && data.fullName.size() <= 200
+          && data.email is string && data.email.size() <= 200
+          && data.status in ['application', 'pending_review', 'approved', 'scheduled', 'orientation', 'active', 'declined']
           && (data.onboardingStep is int || data.onboardingStep == null);
     }
 
-    match /residents/{residentId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn() && isValidResident(request.resource.data);
-      allow update: if isSignedIn() && isValidResident(request.resource.data);
+    function isValidMessage(data) {
+      return data.keys().hasAll(['senderId', 'senderName', 'text', 'createdAt', 'isAdmin'])
+          && data.keys().hasOnly(['senderId', 'senderName', 'text', 'createdAt', 'isAdmin', 'attachment'])
+          && data.senderId == request.auth.uid
+          && data.senderName is string && data.senderName.size() <= 200
+          && data.text is string && data.text.size() <= 1000
+          && (data.attachment == null || (data.attachment is string && data.attachment.size() <= 800000))
+          && (data.isAdmin == isManager()) // Admin flag must match role
+          && data.createdAt == request.time;
     }
-    
-    // Default deny
+
+    // 1. Global Safety Net
     match /{document=**} {
       allow read, write: if false;
+    }
+
+    match /residents/{residentId} {
+      allow read: if isSignedIn() && (existing().ownerId == request.auth.uid || isManager());
+      allow create: if isSignedIn() && isValidResident(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidResident(incoming()) && (existing().ownerId == request.auth.uid || isManager());
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && (get(/databases/$(database)/documents/residents/$(residentId)).data.ownerId == request.auth.uid || isManager());
+        allow create: if isSignedIn() && (get(/databases/$(database)/documents/residents/$(residentId)).data.ownerId == request.auth.uid || isManager()) && isValidMessage(incoming());
+      }
     }
   }
 }
