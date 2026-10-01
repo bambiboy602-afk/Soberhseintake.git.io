@@ -6,7 +6,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, User, signOut } from 'firebase/auth';
-import { getFirestore, collection, addDoc, doc, updateDoc, query, where, getDocs, onSnapshot, orderBy, serverTimestamp, Timestamp } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, doc, updateDoc, query, where, getDocs, onSnapshot, orderBy, serverTimestamp, Timestamp, arrayUnion } from 'firebase/firestore';
 import SignatureCanvas from 'react-signature-canvas';
 import { jsPDF } from 'jspdf';
 import firebaseConfig from '../firebase-applet-config.json';
@@ -16,6 +16,120 @@ import * as sheetsService from './services/GoogleSheetsService';
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const auth = getAuth(app);
+
+export interface StatusHistoryEntry {
+  status: string;
+  changedAt: string;
+  changedBy?: string;
+  note?: string;
+}
+
+export const STATUS_CONFIG: Record<string, { label: string; color: string; badge: string; dot: string; icon: string }> = {
+  application: {
+    label: 'Application Started',
+    color: 'text-blue-700',
+    badge: 'bg-blue-50 text-blue-700 border-blue-200',
+    dot: 'bg-blue-500',
+    icon: '📝',
+  },
+  pending_review: {
+    label: 'Pending Clinical Review',
+    color: 'text-amber-700',
+    badge: 'bg-amber-50 text-amber-700 border-amber-200',
+    dot: 'bg-amber-500',
+    icon: '⏳',
+  },
+  approved: {
+    label: 'Approved by Manager',
+    color: 'text-emerald-700',
+    badge: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+    dot: 'bg-emerald-500',
+    icon: '✓',
+  },
+  scheduled: {
+    label: 'Move-In Scheduled',
+    color: 'text-indigo-700',
+    badge: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+    dot: 'bg-indigo-500',
+    icon: '📅',
+  },
+  orientation: {
+    label: 'Orientation Pending',
+    color: 'text-purple-700',
+    badge: 'bg-purple-50 text-purple-700 border-purple-200',
+    dot: 'bg-purple-500',
+    icon: '🏠',
+  },
+  active: {
+    label: 'Active Move-In',
+    color: 'text-green-700',
+    badge: 'bg-green-50 text-green-700 border-green-200',
+    dot: 'bg-green-500',
+    icon: '✨',
+  },
+  declined: {
+    label: 'Application Declined',
+    color: 'text-red-700',
+    badge: 'bg-red-50 text-red-700 border-red-200',
+    dot: 'bg-red-500',
+    icon: '✕',
+  },
+};
+
+export const formatTimestamp = (isoString?: string) => {
+  if (!isoString) return 'Date unknown';
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return isoString;
+    return d.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return isoString;
+  }
+};
+
+export const getNormalizedTimeline = (res: any): StatusHistoryEntry[] => {
+  if (Array.isArray(res.statusHistory) && res.statusHistory.length > 0) {
+    return [...res.statusHistory].sort((a, b) => {
+      const timeA = new Date(a.changedAt || 0).getTime();
+      const timeB = new Date(b.changedAt || 0).getTime();
+      return timeA - timeB;
+    });
+  }
+
+  // Graceful fallback for historical entries recorded prior to statusHistory schema
+  const fallback: StatusHistoryEntry[] = [];
+  if (res.applicationDate) {
+    fallback.push({
+      status: 'application',
+      changedAt: res.applicationDate,
+      changedBy: res.email || 'Applicant',
+      note: 'Initial application submitted',
+    });
+  }
+  if (res.onboardingStep >= 10 || res.status === 'pending_review' || res.status === 'active' || res.status === 'approved' || res.status === 'declined') {
+    fallback.push({
+      status: 'pending_review',
+      changedAt: res.applicationDate || new Date().toISOString(),
+      changedBy: res.email || 'Applicant',
+      note: 'Completed onboarding documentation and submitted for clinical sign-off',
+    });
+  }
+  if (res.status === 'active' || res.status === 'declined' || res.status === 'approved' || res.status === 'scheduled' || res.status === 'orientation') {
+    fallback.push({
+      status: res.status,
+      changedAt: new Date().toISOString(),
+      changedBy: 'House Manager',
+      note: res.status === 'active' ? 'Approved for move-in and residency activated' : res.status === 'declined' ? 'Application declined' : `Status updated to ${res.status.replace('_', ' ')}`,
+    });
+  }
+  return fallback;
+};
 
 const steps = [
   { title: 'Application', fields: ['fullName', 'dob', 'email', 'language'] },
@@ -51,6 +165,13 @@ export default function App() {
   const [activeTemplate, setActiveTemplate] = useState<driveService.DriveFile | null>(null);
   const [viewMode, setViewMode] = useState<'resident' | 'manager'>('resident');
   const [allResidents, setAllResidents] = useState<any[]>([]);
+  const [residentStatus, setResidentStatus] = useState<string>('application');
+  const [residentStatusHistory, setResidentStatusHistory] = useState<StatusHistoryEntry[]>([]);
+  const [managerNotes, setManagerNotes] = useState<Record<string, string>>({});
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [expandedTimelines, setExpandedTimelines] = useState<Record<string, boolean>>({});
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
   const isAdmin = user?.email === 'bambiboy602@gmail.com';
 
   const TemplateLink = ({ name, label }: { name: string, label: string }) => {
@@ -129,6 +250,8 @@ export default function App() {
             const residentDoc = querySnapshot.docs[0];
             const data = residentDoc.data();
             setResidentId(residentDoc.id);
+            setResidentStatus(data.status || 'application');
+            setResidentStatusHistory(Array.isArray(data.statusHistory) ? data.statusHistory : []);
             setStep(data.onboardingStep - 1);
             setFormData({
               fullName: data.fullName || '',
@@ -415,6 +538,8 @@ export default function App() {
       await signOut(auth);
       setStep(0);
       setResidentId(null);
+      setResidentStatus('application');
+      setResidentStatusHistory([]);
       setFormData({
         fullName: '',
         dob: '',
@@ -474,14 +599,26 @@ export default function App() {
         }
         setError(null);
         setIsSaving(true);
+        const now = new Date().toISOString();
+        const initialStatusHistory: StatusHistoryEntry[] = [
+          {
+            status: 'application',
+            changedAt: now,
+            changedBy: user.email || 'Applicant',
+            note: 'Initial application submitted',
+          },
+        ];
         const docRef = await addDoc(collection(db, 'residents'), {
           ...formData,
           status: 'application',
-          applicationDate: new Date().toISOString(),
+          statusHistory: initialStatusHistory,
+          applicationDate: now,
           onboardingStep: 1,
           ownerId: user.uid,
         });
         setResidentId(docRef.id);
+        setResidentStatus('application');
+        setResidentStatusHistory(initialStatusHistory);
         setIsSaving(false);
         showToast('Application submitted successfully!');
       }
@@ -527,13 +664,23 @@ export default function App() {
   const handleFinish = async () => {
     if (residentId) {
       try {
+        const now = new Date().toISOString();
+        const historyEntry: StatusHistoryEntry = {
+          status: 'pending_review',
+          changedAt: now,
+          changedBy: user?.email || 'Applicant',
+          note: 'Completed all intake packets, signed agreements, and submitted for clinical sign-off',
+        };
         await updateDoc(doc(db, 'residents', residentId), {
           status: 'pending_review',
           onboardingStep: 10, // Marking as past the review step (index 9)
+          statusHistory: arrayUnion(historyEntry),
         });
         
         await syncToComplianceSheet();
         
+        setResidentStatus('pending_review');
+        setResidentStatusHistory((prev) => [...prev, historyEntry]);
         setStep(9);
         showToast('Onboarding complete! Your application is now pending review.');
       } catch (err) {
@@ -543,80 +690,390 @@ export default function App() {
     }
   };
 
-  const updateResidentStatus = async (rid: string, newStatus: string) => {
+  const updateResidentStatus = async (rid: string, newStatus: string, customNote?: string) => {
     try {
-      await updateDoc(doc(db, 'residents', rid), { status: newStatus });
-      showToast(`Status updated to ${newStatus}`);
+      setUpdatingId(rid);
+      const now = new Date().toISOString();
+      const defaultNotes: Record<string, string> = {
+        active: 'Approved for move-in and residency activated',
+        declined: 'Application declined by management',
+        pending_review: 'Placed in pending clinical review',
+        approved: 'Application approved by House Manager',
+        scheduled: 'Move-in date scheduled',
+        orientation: 'Resident scheduled for facility orientation',
+      };
+      const noteToSave = customNote?.trim() || managerNotes[rid]?.trim() || defaultNotes[newStatus] || `Status updated to ${newStatus.replace('_', ' ')}`;
+      const historyEntry: StatusHistoryEntry = {
+        status: newStatus,
+        changedAt: now,
+        changedBy: user?.email || 'House Manager',
+        note: noteToSave,
+      };
+      await updateDoc(doc(db, 'residents', rid), {
+        status: newStatus,
+        statusHistory: arrayUnion(historyEntry),
+      });
+
+      // Clear note for this resident
+      setManagerNotes((prev) => {
+        const copy = { ...prev };
+        delete copy[rid];
+        return copy;
+      });
+
+      showToast(`Status updated to ${newStatus.replace('_', ' ')}`);
     } catch (err) {
       console.error('Error updating status:', err);
       setError('Failed to update status.');
+    } finally {
+      setUpdatingId(null);
     }
   };
 
-  const ManagerDashboard = () => (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h1 className="text-2xl font-bold">House Manager Portal</h1>
-        <button onClick={() => setViewMode('resident')} className="text-xs text-blue-600 hover:underline">Switch to Resident View</button>
-      </div>
-      
-      <div className="grid grid-cols-1 gap-4">
-        {allResidents.length === 0 ? (
-          <p className="text-gray-500 italic text-center py-10">No applicants found.</p>
-        ) : (
-          allResidents.map((res) => (
-            <div key={res.id} className="bg-white border rounded-xl p-4 shadow-sm space-y-3">
-              <div className="flex justify-between items-start">
-                <div>
-                  <h3 className="font-bold text-gray-800">{res.fullName || 'Anonymous'}</h3>
-                  <p className="text-[10px] text-gray-400">{res.email}</p>
-                  <p className="text-[10px] text-gray-500">Applied: {res.applicationDate ? new Date(res.applicationDate).toLocaleDateString() : 'N/A'}</p>
-                </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                  res.status === 'active' ? 'bg-green-100 text-green-700' :
-                  res.status === 'declined' ? 'bg-red-100 text-red-700' :
-                  'bg-yellow-100 text-yellow-700'
-                }`}>
-                  {res.status?.replace('_', ' ')}
-                </span>
-              </div>
-              
-              <div className="grid grid-cols-3 gap-2 text-[9px] text-gray-500 uppercase tracking-tighter font-bold">
-                <div className="flex items-center space-x-1">
-                  <span className={res.checklist?.tbDocumentation ? "text-green-600" : "text-gray-300"}>● TB</span>
-                </div>
-                <div className="flex items-center space-x-1">
-                  <span className={res.houseRulesSigned ? "text-green-600" : "text-gray-300"}>● RULES</span>
-                </div>
-                <div className="flex items-center space-x-1">
-                  <span className={res.checklist?.photoId ? "text-green-600" : "text-gray-300"}>● ID</span>
-                </div>
-              </div>
+  const ManagerDashboard = () => {
+    const counts = {
+      all: allResidents.length,
+      pending_review: allResidents.filter(r => r.status === 'pending_review').length,
+      active: allResidents.filter(r => r.status === 'active').length,
+      declined: allResidents.filter(r => r.status === 'declined').length,
+      application: allResidents.filter(r => r.status === 'application').length,
+    };
 
-              <div className="flex space-x-2 pt-2 border-t">
-                {res.status !== 'active' && (
-                  <button 
-                    onClick={() => updateResidentStatus(res.id, 'active')}
-                    className="flex-1 bg-green-600 text-white text-[10px] font-bold py-2 rounded-lg shadow-sm hover:bg-green-700"
-                  >
-                    Approve
-                  </button>
-                )}
-                {res.status !== 'declined' && (
-                  <button 
-                    onClick={() => updateResidentStatus(res.id, 'declined')}
-                    className="flex-1 bg-white border border-red-200 text-red-600 text-[10px] font-bold py-2 rounded-lg hover:bg-red-50"
-                  >
-                    Decline
-                  </button>
-                )}
-              </div>
+    const filteredResidents = allResidents.filter((res) => {
+      const matchesStatus = statusFilter === 'all' || res.status === statusFilter;
+      const matchesSearch = !searchQuery.trim() || 
+        (res.fullName?.toLowerCase().includes(searchQuery.toLowerCase())) ||
+        (res.email?.toLowerCase().includes(searchQuery.toLowerCase()));
+      return matchesStatus && matchesSearch;
+    });
+
+    return (
+      <div className="space-y-6">
+        {/* Header with Title and Mode Switch */}
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b pb-4">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 flex items-center space-x-2">
+              <span>House Manager Portal</span>
+              <span className="text-xs bg-blue-100 text-blue-800 font-bold px-2.5 py-0.5 rounded-full">
+                AzRHA Level II/III
+              </span>
+            </h1>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Review resident intake dossiers, audit regulatory compliance, and track application progression history.
+            </p>
+          </div>
+          <button 
+            onClick={() => setViewMode('resident')} 
+            className="text-xs font-semibold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 px-3 py-1.5 rounded-lg transition-colors flex items-center space-x-1"
+          >
+            <span>Switch to Resident View</span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+          </button>
+        </div>
+
+        {/* Analytics Chips */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+          <div className="bg-white border rounded-xl p-3 shadow-xs">
+            <div className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">Total Applicants</div>
+            <div className="text-xl font-extrabold text-gray-900 mt-1">{counts.all}</div>
+          </div>
+          <div className="bg-white border rounded-xl p-3 shadow-xs border-amber-200 bg-amber-50/30">
+            <div className="text-[10px] uppercase font-bold text-amber-600 tracking-wider">Pending Review</div>
+            <div className="text-xl font-extrabold text-amber-700 mt-1">{counts.pending_review}</div>
+          </div>
+          <div className="bg-white border rounded-xl p-3 shadow-xs border-green-200 bg-green-50/30">
+            <div className="text-[10px] uppercase font-bold text-green-600 tracking-wider">Active Residents</div>
+            <div className="text-xl font-extrabold text-green-700 mt-1">{counts.active}</div>
+          </div>
+          <div className="bg-white border rounded-xl p-3 shadow-xs border-red-200 bg-red-50/30">
+            <div className="text-[10px] uppercase font-bold text-red-600 tracking-wider">Declined</div>
+            <div className="text-xl font-extrabold text-red-700 mt-1">{counts.declined}</div>
+          </div>
+        </div>
+
+        {/* Filter and Search Bar */}
+        <div className="space-y-2.5">
+          <div className="relative">
+            <input
+              type="text"
+              placeholder="Search applicants by legal name or email..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-4 py-2 border rounded-xl text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-xs"
+            />
+            <svg className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+            </svg>
+          </div>
+
+          <div className="flex flex-wrap gap-1.5 text-xs">
+            {[
+              { id: 'all', label: 'All', count: counts.all },
+              { id: 'pending_review', label: 'Pending Review', count: counts.pending_review },
+              { id: 'active', label: 'Active', count: counts.active },
+              { id: 'declined', label: 'Declined', count: counts.declined },
+              { id: 'application', label: 'In Progress', count: counts.application },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setStatusFilter(tab.id)}
+                className={`px-3 py-1 rounded-lg font-bold text-[11px] transition-all flex items-center space-x-1.5 ${
+                  statusFilter === tab.id
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'bg-white border text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{tab.label}</span>
+                <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                  statusFilter === tab.id ? 'bg-blue-700 text-white' : 'bg-gray-100 text-gray-500'
+                }`}>
+                  {tab.count}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Applicant Cards List */}
+        <div className="grid grid-cols-1 gap-4">
+          {filteredResidents.length === 0 ? (
+            <div className="bg-white border rounded-xl p-10 text-center space-y-2">
+              <p className="text-gray-400 text-xs italic font-medium">No applicants matched your criteria.</p>
+              {searchQuery && (
+                <button 
+                  onClick={() => setSearchQuery('')}
+                  className="text-xs text-blue-600 font-semibold hover:underline"
+                >
+                  Clear search query
+                </button>
+              )}
             </div>
-          ))
-        )}
+          ) : (
+            filteredResidents.map((res) => {
+              const timeline = getNormalizedTimeline(res);
+              const currentStatus = res.status || 'application';
+              const config = STATUS_CONFIG[currentStatus] || {
+                label: currentStatus.replace('_', ' '),
+                color: 'text-gray-700',
+                badge: 'bg-gray-100 text-gray-700 border-gray-200',
+                dot: 'bg-gray-400',
+                icon: '📋',
+              };
+              const isTimelineOpen = expandedTimelines[res.id] !== false; // open by default
+
+              return (
+                <div key={res.id} className="bg-white border rounded-xl p-5 shadow-xs space-y-4 hover:border-gray-300 transition-all">
+                  {/* Card Header */}
+                  <div className="flex justify-between items-start gap-2">
+                    <div className="space-y-0.5">
+                      <div className="flex items-center space-x-2">
+                        <h3 className="font-bold text-gray-900 text-base">{res.fullName || 'Anonymous Applicant'}</h3>
+                        <span className="text-[10px] font-mono text-gray-400">#{res.id.slice(0, 6)}</span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
+                        <span className="flex items-center space-x-1">
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
+                          <span>{res.email}</span>
+                        </span>
+                        {res.emergencyContact?.phone && (
+                          <span className="flex items-center space-x-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+                            <span>{res.emergencyContact.phone}</span>
+                          </span>
+                        )}
+                        <span>Applied: {formatTimestamp(res.applicationDate)}</span>
+                      </div>
+                    </div>
+                    
+                    {/* Status Badge */}
+                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border shadow-2xs whitespace-nowrap ${config.badge}`}>
+                      {config.icon} {config.label}
+                    </span>
+                  </div>
+
+                  {/* Arizona Compliance Badges */}
+                  <div className="bg-gray-50/70 p-2.5 rounded-lg border border-gray-100 flex flex-wrap items-center justify-between gap-2 text-[10px] font-bold">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className={`flex items-center space-x-1 ${res.checklist?.tbDocumentation ? 'text-green-700' : 'text-gray-400'}`}>
+                        <span>{res.checklist?.tbDocumentation ? '✓' : '○'}</span>
+                        <span>TB Freedom (§ R9-10-113)</span>
+                      </span>
+                      <span className={`flex items-center space-x-1 ${res.checklist?.authorizedPresence ? 'text-green-700' : 'text-gray-400'}`}>
+                        <span>{res.checklist?.authorizedPresence ? '✓' : '○'}</span>
+                        <span>Presence (§ 41-1080)</span>
+                      </span>
+                      <span className={`flex items-center space-x-1 ${res.houseRulesSigned ? 'text-green-700' : 'text-gray-400'}`}>
+                        <span>{res.houseRulesSigned ? '✓' : '○'}</span>
+                        <span>House Rules</span>
+                      </span>
+                      <span className={`flex items-center space-x-1 ${res.residencyPaymentSigned ? 'text-green-700' : 'text-gray-400'}`}>
+                        <span>{res.residencyPaymentSigned ? '✓' : '○'}</span>
+                        <span>Residency Agmt</span>
+                      </span>
+                      <span className={`flex items-center space-x-1 ${res.treatmentAgreementSigned ? 'text-green-700' : 'text-gray-400'}`}>
+                        <span>{res.treatmentAgreementSigned ? '✓' : '○'}</span>
+                        <span>AMPM 320-V</span>
+                      </span>
+                    </div>
+                    {res.insurance?.planName && (
+                      <span className="text-gray-500 font-normal">
+                        Payer: <strong className="text-gray-700">{res.insurance.planName}</strong>
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Status Progression Timeline Section */}
+                  <div className="border rounded-xl p-3.5 bg-gray-50/40 space-y-3">
+                    <div className="flex justify-between items-center">
+                      <div className="flex items-center space-x-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        <h4 className="text-xs font-bold text-gray-800 uppercase tracking-wider">Application Progression Timeline</h4>
+                        <span className="bg-blue-100 text-blue-700 font-mono text-[9px] px-1.5 py-0.2 rounded-full font-bold">
+                          {timeline.length} {timeline.length === 1 ? 'event' : 'events'}
+                        </span>
+                      </div>
+                      <button 
+                        onClick={() => setExpandedTimelines(prev => ({ ...prev, [res.id]: !isTimelineOpen }))}
+                        className="text-[10px] text-gray-500 hover:text-gray-700 font-semibold underline"
+                      >
+                        {isTimelineOpen ? 'Hide History' : 'Show History'}
+                      </button>
+                    </div>
+
+                    {isTimelineOpen && (
+                      <div className="pt-1">
+                        <div className="relative pl-6 space-y-4 before:absolute before:bottom-2 before:top-2 before:left-[11px] before:w-0.5 before:bg-gray-200">
+                          {timeline.map((entry, idx) => {
+                            const isLatest = idx === timeline.length - 1;
+                            const stageConfig = STATUS_CONFIG[entry.status] || {
+                              label: entry.status.replace('_', ' '),
+                              color: 'text-gray-700',
+                              badge: 'bg-gray-100 text-gray-700 border-gray-200',
+                              dot: 'bg-gray-400',
+                              icon: '•',
+                            };
+
+                            return (
+                              <div key={idx} className="relative text-left">
+                                {/* Timeline Node / Dot */}
+                                <div className={`absolute -left-6 top-1 w-4 h-4 rounded-full border-2 border-white shadow-xs ${stageConfig.dot} flex items-center justify-center`}>
+                                  {isLatest && (
+                                    <div className="w-1.5 h-1.5 bg-white rounded-full"></div>
+                                  )}
+                                </div>
+
+                                <div className="bg-white border rounded-lg p-2.5 shadow-2xs space-y-1">
+                                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                                    <div className="flex items-center space-x-1.5">
+                                      <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${stageConfig.badge}`}>
+                                        {stageConfig.label}
+                                      </span>
+                                      {isLatest && (
+                                        <span className="text-[9px] bg-green-100 text-green-800 font-bold px-1.5 py-0.2 rounded">
+                                          Current Status
+                                        </span>
+                                      )}
+                                    </div>
+                                    <span className="text-[9px] font-medium text-gray-400">
+                                      {formatTimestamp(entry.changedAt)}
+                                    </span>
+                                  </div>
+
+                                  {entry.note && (
+                                    <p className="text-[11px] text-gray-700 leading-snug font-medium pt-0.5">
+                                      {entry.note}
+                                    </p>
+                                  )}
+
+                                  {entry.changedBy && (
+                                    <div className="text-[9px] text-gray-400 italic pt-0.5 flex items-center space-x-1">
+                                      <span>Recorded by: {entry.changedBy}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Manager Direct Action Panel */}
+                  <div className="pt-2 border-t space-y-2">
+                    <div className="flex flex-col sm:flex-row gap-2 items-center">
+                      <input
+                        type="text"
+                        placeholder="Add custom progression note (optional, e.g. 'Bed #3 assigned, TB verified')..."
+                        value={managerNotes[res.id] || ''}
+                        onChange={(e) => setManagerNotes({ ...managerNotes, [res.id]: e.target.value })}
+                        className="w-full text-xs p-2 border rounded-lg bg-gray-50 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {res.status !== 'active' && (
+                        <button 
+                          onClick={() => updateResidentStatus(res.id, 'active')}
+                          disabled={updatingId === res.id}
+                          className="flex-1 min-w-[120px] bg-green-600 hover:bg-green-700 text-white text-[11px] font-bold py-2 px-3 rounded-lg shadow-xs transition-colors flex items-center justify-center space-x-1 disabled:opacity-50"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                          <span>Approve Move-In</span>
+                        </button>
+                      )}
+
+                      {res.status !== 'declined' && (
+                        <button 
+                          onClick={() => updateResidentStatus(res.id, 'declined')}
+                          disabled={updatingId === res.id}
+                          className="flex-1 min-w-[100px] bg-white border border-red-200 text-red-600 hover:bg-red-50 text-[11px] font-bold py-2 px-3 rounded-lg transition-colors flex items-center justify-center space-x-1 disabled:opacity-50"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                          <span>Decline</span>
+                        </button>
+                      )}
+
+                      {res.status !== 'pending_review' && (
+                        <button
+                          onClick={() => updateResidentStatus(res.id, 'pending_review')}
+                          disabled={updatingId === res.id}
+                          className="bg-white border border-amber-300 text-amber-700 hover:bg-amber-50 text-[10px] font-bold py-2 px-2.5 rounded-lg transition-colors disabled:opacity-50"
+                          title="Place application back in pending clinical review"
+                        >
+                          ⏳ Pending Review
+                        </button>
+                      )}
+
+                      {res.status !== 'scheduled' && res.status !== 'active' && (
+                        <button
+                          onClick={() => updateResidentStatus(res.id, 'scheduled')}
+                          disabled={updatingId === res.id}
+                          className="bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-50 text-[10px] font-bold py-2 px-2.5 rounded-lg transition-colors disabled:opacity-50"
+                        >
+                          📅 Schedule Move-In
+                        </button>
+                      )}
+
+                      {res.status !== 'orientation' && res.status !== 'active' && (
+                        <button
+                          onClick={() => updateResidentStatus(res.id, 'orientation')}
+                          disabled={updatingId === res.id}
+                          className="bg-white border border-purple-200 text-purple-700 hover:bg-purple-50 text-[10px] font-bold py-2 px-2.5 rounded-lg transition-colors disabled:opacity-50"
+                        >
+                          🏠 Orientation
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   if (loading) {
     return <div className="flex items-center justify-center h-screen">Loading...</div>;
@@ -640,7 +1097,7 @@ export default function App() {
   }
 
   return (
-    <div className="p-8 max-w-md mx-auto">
+    <div className={`p-4 sm:p-8 ${viewMode === 'manager' ? 'max-w-4xl' : 'max-w-md'} mx-auto transition-all`}>
       {isAdmin && (
         <div className="mb-6 flex justify-center">
           <div className="bg-gray-100 p-1 rounded-lg flex space-x-1">
@@ -980,8 +1437,10 @@ export default function App() {
           <div className="bg-white border rounded-xl p-5 shadow-sm space-y-4">
             <div className="flex justify-between items-center border-b pb-3">
               <span className="text-sm font-medium text-gray-500 uppercase tracking-tighter">Application Status</span>
-              <span className="px-3 py-1 bg-yellow-100 text-yellow-700 rounded-full text-[10px] font-bold uppercase tracking-wider">
-                Pending Clinical Review
+              <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border shadow-2xs ${
+                STATUS_CONFIG[residentStatus]?.badge || 'bg-yellow-100 text-yellow-700 border-yellow-200'
+              }`}>
+                {STATUS_CONFIG[residentStatus]?.icon} {STATUS_CONFIG[residentStatus]?.label || 'Pending Clinical Review'}
               </span>
             </div>
             
@@ -1003,6 +1462,57 @@ export default function App() {
                 <p className="text-[10px] text-gray-500 mt-2 italic leading-tight bg-white p-2 rounded border border-dashed">
                   "Please allow 24 hours for BHT/BHP file sign-off. We will verify your TB documentation and A.R.S. § 41-1080 status before scheduling your move-in."
                 </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Resident Application Progression Timeline Card */}
+          <div className="bg-white border rounded-xl p-5 shadow-sm space-y-3">
+            <div className="flex items-center space-x-2">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+              <h3 className="text-sm font-bold text-gray-800">Your Progression Timeline</h3>
+            </div>
+            <div className="pt-1">
+              <div className="relative pl-6 space-y-3.5 before:absolute before:bottom-2 before:top-2 before:left-[11px] before:w-0.5 before:bg-gray-200">
+                {getNormalizedTimeline({
+                  status: residentStatus,
+                  statusHistory: residentStatusHistory,
+                  applicationDate: formData.fullName ? new Date().toISOString() : undefined,
+                  onboardingStep: 10
+                }).map((entry, idx, arr) => {
+                  const isLatest = idx === arr.length - 1;
+                  const itemConfig = STATUS_CONFIG[entry.status] || {
+                    label: entry.status.replace('_', ' '),
+                    color: 'text-gray-700',
+                    badge: 'bg-gray-100 text-gray-700 border-gray-200',
+                    dot: 'bg-gray-400',
+                    icon: '•',
+                  };
+
+                  return (
+                    <div key={idx} className="relative text-left">
+                      <div className={`absolute -left-6 top-1 w-4 h-4 rounded-full border-2 border-white shadow-xs ${itemConfig.dot} flex items-center justify-center`}>
+                        {isLatest && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                      </div>
+                      <div className="bg-gray-50 border rounded-lg p-2.5 space-y-1">
+                        <div className="flex items-center justify-between gap-1 flex-wrap">
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${itemConfig.badge}`}>
+                            {itemConfig.label}
+                          </span>
+                          <span className="text-[9px] text-gray-400 font-medium">
+                            {formatTimestamp(entry.changedAt)}
+                          </span>
+                        </div>
+                        {entry.note && (
+                          <p className="text-[11px] text-gray-700 font-medium leading-snug">{entry.note}</p>
+                        )}
+                        {entry.changedBy && (
+                          <div className="text-[9px] text-gray-400 italic">By: {entry.changedBy}</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>

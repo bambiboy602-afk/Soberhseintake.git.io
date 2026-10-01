@@ -11,10 +11,11 @@ service cloud.firestore {
     // 2. Validation Blueprints
     function isValidResident(data) {
       return data.keys().hasAll(['fullName', 'email', 'status', 'ownerId'])
-          && data.keys().hasOnly(['fullName', 'dob', 'email', 'language', 'status', 'applicationDate', 'managerId', 'onboardingStep', 'emergencyContact', 'insurance', 'houseRulesSigned', 'residencyPaymentSigned', 'treatmentAgreementSigned', 'generalConsentSigned', 'roiSigned', 'nppSigned', 'documentsSubmitted', 'checklist', 'ownerId'])
+          && data.keys().hasOnly(['fullName', 'dob', 'email', 'language', 'status', 'statusHistory', 'applicationDate', 'managerId', 'onboardingStep', 'emergencyContact', 'insurance', 'houseRulesSigned', 'residencyPaymentSigned', 'treatmentAgreementSigned', 'generalConsentSigned', 'roiSigned', 'nppSigned', 'documentsSubmitted', 'checklist', 'ownerId'])
           && data.fullName is string && data.fullName.size() <= 200
           && data.email is string && data.email.size() <= 200
           && data.status in ['application', 'pending_review', 'approved', 'scheduled', 'orientation', 'active', 'declined']
+          && (!('statusHistory' in data) || (data.statusHistory is list && data.statusHistory.size() <= 50))
           && (data.onboardingStep is int || data.onboardingStep == null);
     }
 

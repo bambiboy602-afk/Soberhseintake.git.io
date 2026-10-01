@@ -9,7 +9,21 @@
         "dob": { "type": "string" },
         "email": { "type": "string", "format": "email" },
         "language": { "type": "string" },
-        "status": { "type": "string", "enum": ["application", "pending_review", "approved", "scheduled", "orientation", "active"] },
+        "status": { "type": "string", "enum": ["application", "pending_review", "approved", "scheduled", "orientation", "active", "declined"] },
+        "statusHistory": {
+          "type": "array",
+          "description": "Chronological history of application and residency status changes",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": { "type": "string" },
+              "changedAt": { "type": "string", "format": "date-time" },
+              "changedBy": { "type": "string" },
+              "note": { "type": "string" }
+            },
+            "required": ["status", "changedAt"]
+          }
+        },
         "applicationDate": { "type": "string", "format": "date-time" },
         "managerId": { "type": "string" },
         "onboardingStep": { "type": "integer" },
